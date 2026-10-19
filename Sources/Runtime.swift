@@ -44,10 +44,10 @@ final class ASRProcess: ASRProvider, @unchecked Sendable {
     private var closed = false
     var event: ((ASREvent) -> Void)?
     var failure: ((String) -> Void)?
-    init(resources: URL, log: URL) throws {
+    init(resources: URL, model: URL, log: URL) throws {
         signal(SIGPIPE, SIG_IGN)
         process.executableURL = resources.appendingPathComponent("Runtime/nemo/bin/asr-bridge")
-        process.arguments = [resources.appendingPathComponent("Models/nemotron-speech-streaming-en-0.6b.q8_0.gguf").path]
+        process.arguments = [model.path]
         process.standardInput = input; process.standardOutput = output
         FileManager.default.createFile(atPath: log.path, contents: nil)
         process.standardError = try FileHandle(forWritingTo: log)
@@ -109,7 +109,7 @@ final class Translator {
         let c = URLSessionConfiguration.ephemeral; c.timeoutIntervalForRequest = 12; c.timeoutIntervalForResource = 15
         return URLSession(configuration: c)
     }()
-    func start(resources: URL, log: URL) async throws {
+    func start(resources: URL, model: URL, log: URL) async throws {
         // Obtain an unused loopback port; child startup verifies binding through authenticated health.
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw NSError(domain:"无法创建本地端口",code:1) }
@@ -124,7 +124,7 @@ final class Translator {
         // Release the reservation before launching the listener.
         shutdown(fd, SHUT_RDWR)
         let p = Process(); p.executableURL = resources.appendingPathComponent("Runtime/llama/llama-server")
-        p.arguments = ["-m",resources.appendingPathComponent("Models/Hy-MT2-1.8B-Q4_K_M.gguf").path,"-ngl","99","-c","2048","-np","1","--host","127.0.0.1","--port",String(port),"--jinja","--api-key",token,"--log-verbosity","1"]
+        p.arguments = ["-m",model.path,"-ngl","99","-c","2048","-np","1","--host","127.0.0.1","--port",String(port),"--jinja","--api-key",token,"--log-verbosity","1"]
         FileManager.default.createFile(atPath: log.path, contents: nil)
         let handle = try FileHandle(forWritingTo: log); p.standardOutput = handle; p.standardError = handle
         // close bound socket now (defer close is harmless after fd invalidation only if no reuse; use dup design below)

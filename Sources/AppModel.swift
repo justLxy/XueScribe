@@ -2,27 +2,38 @@ import Foundation
 import SwiftUI
 import AppKit
 
+/// The live hypothesis changes with every ASR update (~10 Hz). Keeping it in its
+/// own object means those updates re-render only the partial line, not the
+/// history list or the Settings window that observe AppModel.
+@MainActor
+final class LiveCaption: ObservableObject {
+    @Published var partial = ""
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var displayMode = UserDefaults.standard.string(forKey:"displayMode") ?? "history" { didSet { save("displayMode",displayMode); windowChange?() } }
     @Published var historyLimit = UserDefaults.standard.object(forKey:"historyLimit") as? Int ?? 300 { didSet { save("historyLimit",historyLimit); history.trim(to:historyLimit) } }
     @Published var followLatest = true
     @Published var history = CaptionHistory()
-    @Published var hovering = false
     @Published var status = "就绪"
     @Published var running = false
     @Published var busy = false
-    @Published var partial = ""
     @Published var english = ""
     @Published var chinese = "Turn speech into text, quietly."
     @Published var latency = ""
     @Published var provider = ASRProviderKind.initialSelection { didSet { save("asrProvider",provider.rawValue) } }
     @Published private(set) var hasAssemblyAIKey = CredentialStore.hasAssemblyAIKey
+    @Published private(set) var modelsReady = false
+    @Published private(set) var modelDownloadProgress: Double?
+    @Published private(set) var modelDownloadStatus = ""
     @Published var assemblyAIKeyDraft = ""
     @Published var assemblyAIKeyMessage = ""
     @Published var source = UserDefaults.standard.string(forKey:"source") ?? "microphone" { didSet { save("source",source) } }
-    @Published var opacity = UserDefaults.standard.object(forKey:"opacity") as? Double ?? 0.78 { didSet { save("opacity",opacity) } }
-    @Published var textTone = UserDefaults.standard.string(forKey:"textTone") ?? ((UserDefaults.standard.object(forKey:"opacity") as? Double ?? 0.78) == 0 ? "dark" : "light") { didSet { save("textTone",textTone) } }
+    @Published var opacity = UserDefaults.standard.object(forKey:"opacity") as? Double ?? 0.78 { didSet { save("opacity",opacity); windowChange?() } }
+    /// "system", "light" or "dark"; applied as the window appearance so AppKit and SwiftUI agree.
+    @Published var appearance = UserDefaults.standard.string(forKey:"appearance") ?? "system" { didSet { save("appearance",appearance); windowChange?() } }
+    @Published var showAssistantPane = UserDefaults.standard.object(forKey:"showAssistantPane") as? Bool ?? true { didSet { save("showAssistantPane",showAssistantPane); windowChange?() } }
     @Published var englishFontSize = UserDefaults.standard.object(forKey:"englishFontSize") as? Double ?? max(8, (UserDefaults.standard.object(forKey:"fontSize") as? Double ?? 28) * 0.68) { didSet { save("englishFontSize",englishFontSize) } }
     @Published var switchingSource = false
     @Published var fontSize = UserDefaults.standard.object(forKey:"fontSize") as? Double ?? 28 { didSet { save("fontSize",fontSize) } }
@@ -30,13 +41,18 @@ final class AppModel: ObservableObject {
     @Published var showChinese = UserDefaults.standard.object(forKey:"showChinese") as? Bool ?? true { didSet { save("showChinese",showChinese) } }
     @Published var clickThrough = false { didSet { windowChange?() } }
     @Published var onTop = true { didSet { windowChange?() } }
+    /// Marks our windows as excluded from screen capture (NSWindow.sharingType).
+    @Published var hideFromCapture = UserDefaults.standard.object(forKey:"hideFromCapture") as? Bool ?? true { didSet { save("hideFromCapture",hideFromCapture); windowChange?() } }
     @Published var glossary = UserDefaults.standard.string(forKey:"glossary") ?? DefaultGlossary.text { didSet { save("glossary",glossary) } }
+    let live = LiveCaption()
+    let assistant: AnswerAssistant
     var windowChange: (() -> Void)?
     var showSettings: (() -> Void)?
     var hideWindow: (() -> Void)?
     var quitApp: (() -> Void)?
     let support: URL
     let transcripts: URL
+    private let modelStore: ModelStore
     private let resources = Bundle.main.resourceURL!
     private var capture: AudioCapture?
     private var asr: (any ASRProvider)?
@@ -59,9 +75,10 @@ final class AppModel: ObservableObject {
     private var lastAudio = 0.0
     private var captureStarted: Date?
     private var firstPartial = true
-    init() {
+    /// `supportDirectory` lets offscreen UI renders use a scratch folder instead of the real library.
+    init(supportDirectory: URL? = nil) {
         let applicationSupport = FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0]
-        let newSupport = applicationSupport.appendingPathComponent("XueScribe")
+        let newSupport = supportDirectory ?? applicationSupport.appendingPathComponent("XueScribe")
         let legacySupport = applicationSupport.appendingPathComponent("LumaCaption")
         if !FileManager.default.fileExists(atPath:newSupport.path),
            FileManager.default.fileExists(atPath:legacySupport.path) {
@@ -69,12 +86,20 @@ final class AppModel: ObservableObject {
         }
         support = newSupport
         transcripts = support.appendingPathComponent("Transcripts")
+        let modelDirectory = support.appendingPathComponent("Models",isDirectory:true)
+        modelStore = ModelStore(directory:modelDirectory)
+        modelsReady = ModelStore.modelsAreReady(in:modelDirectory)
+        assistant = AnswerAssistant(support:newSupport)
         try? FileManager.default.createDirectory(at:transcripts,withIntermediateDirectories:true)
         let defaults = UserDefaults.standard
         if defaults.integer(forKey:"courseGlossaryVersion") < DefaultGlossary.version {
             glossary = DefaultGlossary.merging(into:glossary)
             defaults.set(glossary,forKey:"glossary")
             defaults.set(DefaultGlossary.version,forKey:"courseGlossaryVersion")
+        }
+        assistant.transcriptProvider = { [weak self] in
+            guard let self else { return "" }
+            return AnswerPrompt.recentTranscript(lines:history.entries.map(\.english),partial:live.partial)
         }
     }
     private func save(_ key:String,_ value:Any) { UserDefaults.standard.set(value,forKey:key) }
@@ -119,20 +144,32 @@ final class AppModel: ObservableObject {
         busy = true; stopping = false; generation = UUID(); let sessionID = generation
         firstPartial = true; lastAudio = 0; captureStarted = nil
         if !preserveHistory { history = CaptionHistory(); followLatest = true; english = ""; chinese = "" }
-        partial = ""; latency = ""; pending = []; activeTranslation = nil; translationWorkerID = nil
+        live.partial = ""; latency = ""; pending = []; activeTranslation = nil; translationWorkerID = nil
         segmenter = Segmenter(); acceptASREvents = true; asrDrained = false; versions = [:]
         startupTask = Task { [self] in
             do {
+                status = modelsReady ? "正在检查本地模型" : "准备下载两个本地模型 · 约 1.7 GB"
+                let models = try await modelStore.ensureModels { [weak self] update in
+                    Task { @MainActor in
+                        guard let self, self.generation == sessionID, self.busy else { return }
+                        self.modelDownloadProgress = update.fraction
+                        self.modelDownloadStatus = "\(update.phase) · \(update.modelName) · \(Int((update.fraction * 100).rounded()))%"
+                        self.status = self.modelDownloadStatus
+                    }
+                }
+                try Task.checkCancellation()
+                guard generation == sessionID else { return }
+                modelsReady = true; modelDownloadProgress = nil; modelDownloadStatus = "两个本地模型已就绪"
                 journal = try TranscriptJournal(root:transcripts)
                 try journal?.record(["type":"session_start","source":sampleSeconds == nil ? source : "test_fixture","sample_seconds":sampleSeconds ?? 0,"asr_provider":provider.rawValue])
                 status = "正在加载 Hy-MT2 · Metal"
-                try await translator.start(resources:resources,log:journal!.directory.appendingPathComponent("llama.log"))
+                try await translator.start(resources:resources,model:models.translation,log:journal!.directory.appendingPathComponent("llama.log"))
                 try Task.checkCancellation()
                 guard generation == sessionID else { return }
                 status = provider == .local ? "正在加载 Nemotron English · Metal" : "正在连接 AssemblyAI · 云端 ASR"
                 let bridge: any ASRProvider
                 switch provider {
-                case .local: bridge = try ASRProcess(resources:resources,log:journal!.directory.appendingPathComponent("asr.log"))
+                case .local: bridge = try ASRProcess(resources:resources,model:models.asr,log:journal!.directory.appendingPathComponent("asr.log"))
                 case .assemblyAI: bridge = AssemblyAIProvider(apiKey:assemblyAIKey!)
                 }
                 bridge.event = { [weak self] event in DispatchQueue.main.async {
@@ -145,8 +182,10 @@ final class AppModel: ObservableObject {
                     else { self.fail(message) }
                 } }
                 asr = bridge; try bridge.start()
-                for _ in 0..<180 {
-                    if running { break }; try await Task.sleep(nanoseconds:500_000_000); try Task.checkCancellation()
+                // Poll finely: the ready event arrives asynchronously and every
+                // interval of slack here delays the first caption.
+                for _ in 0..<1800 {
+                    if running { break }; try await Task.sleep(nanoseconds:50_000_000); try Task.checkCancellation()
                 }
                 guard running else { throw NSError(domain:"ASR 启动超时",code:1) }
                 captureStarted = Date()
@@ -171,8 +210,15 @@ final class AppModel: ObservableObject {
                 }
                 timer = stabilityTimer
                 RunLoop.main.add(stabilityTimer,forMode:.common)
-            } catch is CancellationError { await capture?.stop(); capture = nil; asr?.terminate(); translator.stop() }
-            catch { if generation == sessionID { fail(error.localizedDescription) } }
+            } catch is CancellationError {
+                modelDownloadProgress = nil; modelDownloadStatus = ""
+                await capture?.stop(); capture = nil; asr?.terminate(); translator.stop()
+            }
+            catch {
+                modelDownloadProgress = nil
+                modelsReady = ModelStore.modelsAreReady(in:support.appendingPathComponent("Models",isDirectory:true))
+                if generation == sessionID { fail(error.localizedDescription) }
+            }
         }
     }
     func saveAssemblyAIKey(_ key:String) throws {
@@ -238,10 +284,12 @@ final class AppModel: ObservableObject {
             }
         }
         let preview = segmenter.preview
-        if partial != preview { partial = preview }
+        if live.partial != preview { live.partial = preview }
         let translationBacklog = pending.count + (activeTranslation == nil ? 0 : 1)
         if translationBacklog >= 12 { fail("翻译积压过多，已停止捕获；英文已保存在 transcript。请关闭其他高负载应用后重试。"); return }
-        if translationBacklog > 2 { status = "翻译积压 \(translationBacklog) 段" }
+        // Assigning @Published invalidates observers even when the value is unchanged.
+        let backlogStatus = "翻译积压 \(translationBacklog) 段"
+        if translationBacklog > 2, status != backlogStatus { status = backlogStatus }
         if translationTask == nil && !pending.isEmpty { translateQueue() }
     }
     private var displayedID: UUID?
@@ -295,6 +343,7 @@ final class AppModel: ObservableObject {
     }
     func stop() async {
         guard !stopping else { return }; stopping = true
+        let hadJournal = journal != nil
         startupTask?.cancel(); sampleTimer?.invalidate(); sampleTimer = nil
         timer?.invalidate(); timer = nil
         await capture?.stop(); capture = nil
@@ -304,7 +353,7 @@ final class AppModel: ObservableObject {
         acceptASREvents = false
         asr?.terminate(); asr = nil
         apply(segmenter.tick(force:true))
-        partial = ""
+        live.partial = ""
         for _ in 0..<150 { if translationTask == nil { break }; try? await Task.sleep(nanoseconds:100_000_000) }
         if translationTask != nil {
             record(["type":"translation_drain_timeout","remaining":pending.map(\.english)])
@@ -317,9 +366,11 @@ final class AppModel: ObservableObject {
         do { try journal?.finish() }
         catch { journalFailure = "记录保存失败：\(error.localizedDescription)" }
         journal = nil
+        modelDownloadProgress = nil
+        if !modelsReady { modelDownloadStatus = "" }
         if let keepAwake { ProcessInfo.processInfo.endActivity(keepAwake) }; keepAwake = nil
         busy = false; running = false; stopping = false
-        status = journalFailure ?? "已停止 · 双语记录已保存"
+        status = journalFailure ?? (hadJournal ? "已停止 · 双语记录已保存" : "已停止")
         if CommandLine.arguments.contains("--headless") { NSApp.terminate(nil) }
     }
     private func record(_ row:[String:Any]) {

@@ -30,8 +30,11 @@ int main(int argc,char**argv) {
  if(argc!=2){fprintf(stderr,"Usage: asr-bridge MODEL.gguf < mono-f32le-16000\n");return 1;}
  nemo_speech_asr_backend_config backend{sizeof(backend),0};
  nemo_speech_asr_model_config model{sizeof(model),argv[1],nullptr};
- nemo_speech_asr_streaming_config streaming{sizeof(streaming),1.0f,0,0,1};
- nemo_speech_asr_endpointing_config endpoint{sizeof(endpoint),true,false,800};
+ // 560 ms RNNT lookahead and a 2 s end-of-utterance window: shorter windows made the
+ // model close utterances at hesitation pauses, inventing periods/capitals and
+ // dropping words at each decoder reset (WER 5.7% -> 1.7% on a paused-speech replay).
+ nemo_speech_asr_streaming_config streaming{sizeof(streaming),1.0f,0,0,6};
+ nemo_speech_asr_endpointing_config endpoint{sizeof(endpoint),true,false,2000};
  nemo_speech_asr_recognizer_config cfg{};cfg.size=sizeof(cfg);cfg.backend=&backend;cfg.model=&model;cfg.streaming=&streaming;cfg.endpointing=&endpoint;
  nemo_speech_asr_recognizer* rec=nullptr;check(nemo_speech_asr_create(&cfg,&rec));
  auto options=nemo_speech_asr_recognition_options_default();options.language_code="en-US";options.interim_results=true;options.enable_automatic_punctuation=true;

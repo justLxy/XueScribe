@@ -16,10 +16,16 @@ clang++ -O2 -std=c++17 Bridge/asr_bridge.cpp -I Dependencies/include -L "$runtim
 rm -f "$app/Contents/MacOS/LumaCaption"
 swift_sources=(Sources/*.swift)
 swift_sources=(${swift_sources:#Sources/LocalSecrets.swift})
-swiftc -swift-version 5 -O -target arm64-apple-macos14.0 $swift_sources -o "$app/Contents/MacOS/XueScribe" -framework SwiftUI -framework AppKit -framework AVFoundation -framework ScreenCaptureKit -framework Carbon -framework NaturalLanguage
+swiftc -swift-version 5 -O -wmo -target arm64-apple-macos14.0 $swift_sources -o "$app/Contents/MacOS/XueScribe" -framework SwiftUI -framework AppKit -framework AVFoundation -framework ScreenCaptureKit -framework Carbon -framework NaturalLanguage
 cp Resources/Info.plist "$app/Contents/Info.plist"
 cp Resources/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
 cp Resources/NOTICE.txt "$app/Contents/Resources/NOTICE.txt"
+# Models are downloaded and SHA-256 verified on first use. Never ship stale or
+# accidentally licensed model binaries inside the application bundle.
+bundled_models="$app/Contents/Resources/Models"
+if [[ -d "$bundled_models" ]]; then
+    rm -rf -- "$bundled_models"
+fi
 codesign --force --deep --sign - "$app"
 codesign --verify --deep --strict "$app"
 print "Built: $app"
